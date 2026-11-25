@@ -1,0 +1,67 @@
+{
+  "checkpoint": "log\\ppo_ckpt.pt",
+  "update": 120,
+  "episodes": [
+    {
+      "episode": 0,
+      "steps": 21,
+      "success": true,
+      "final_dist_px": 19.215157550411256,
+      "min_dist_px": 18.75001602523568,
+      "settled_dist_px": 20.412199732438488,
+      "return": -1.2410539395589977
+    },
+    {
+      "episode": 1,
+      "steps": 27,
+      "success": true,
+      "final_dist_px": 9.212700617209292,
+      "min_dist_px": 9.212700617209292,
+      "settled_dist_px": 17.09915943641436,
+      "return": -5.475282873419603
+    },
+    {
+      "episode": 2,
+      "steps": 23,
+      "success": true,
+      "final_dist_px": 7.4459815584368405,
+      "min_dist_px": 7.4459815584368405,
+      "settled_dist_px": 17.38225066166432,
+      "return": -3.7299863379729046
+    },
+    {
+      "episode": 3,
+      "steps": 19,
+      "success": true,
+      "final_dist_px": 17.308822184615842,
+      "min_dist_px": 14.925183653522385,
+      "settled_dist_px": 21.845948545211847,
+      "return": -3.137536992478301
+    },
+    {
+      "episode": 4,
+      "steps": 23,
+      "success": true,
+      "final_dist_px": 12.036553594812526,
+      "min_dist_px": 12.036553594812526,
+      "settled_dist_px": 18.421527687796427,
+      "return": -2.1848271598765585
+    },
+    {
+      "episode": 5,
+      "steps": 25,
+      "success": true,
+      "final_dist_px": 12.125996815506113,
+      "min_dist_px": 12.125996815506113,
+      "settled_dist_px": 18.98252451788745,
+      "return": -0.5964066441153214
+    }
+  ],
+  "success_rate": 1.0,
+  "mean_final_dist_px": 12.890868720165313,
+  "image_size": 640,
+  "pixels_per_metre": 888.8888888888889,
+  "det_fallback": 34,
+  "det_occluded": 44,
+  "env_steps": 138
+}
