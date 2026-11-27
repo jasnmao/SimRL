@@ -49,12 +49,18 @@
   "control": {
     "max_action": 0.05,
     "substeps": 20,
-    "action_smooth": "step",
+    "action_smooth": "filt",
     "omega_n": 25.0,
     "zeta": 1.0,
     "kp": null,
     "kd": null,
-    "id_clip": true
+    "id_clip": true,
+    "traj_omega_n": 18.0,
+    "traj_zeta": 1.0,
+    "traj_vend": "flow",
+    "traj_qdd_max": 300.0,
+    "filt_omega": 15.0,
+    "filt_zeta": 1.0
   },
   "episode": {
     "max_steps": 120,
@@ -83,14 +89,14 @@
   "ppo": {
     "num_envs": 8,
     "rollout_steps": 64,
-    "total_updates": 220,
+    "total_updates": 150,
     "gamma": 0.985,
     "lam": 0.95,
     "clip": 0.2,
     "epochs": 6,
     "minibatch": 256,
-    "lr": 0.0003,
-    "ent_coef": 0.002,
+    "lr": 0.0001,
+    "ent_coef": 0.001,
     "vf_coef": 0.5,
     "max_grad_norm": 0.5,
     "hidden": [

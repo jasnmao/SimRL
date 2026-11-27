@@ -45,6 +45,7 @@ class VecPointingEnv:
         device: str = "cuda",
         render: bool = True,
         detector: SphereDetector | None = None,
+        record_substeps: bool = False,
     ):
         self.cfg = cfg or C.default_config()
         self.n = n_envs
@@ -54,6 +55,8 @@ class VecPointingEnv:
         self.dt = float(self.model.opt.timestep)
         self.nsub = self.cfg.control.substeps
         self.render_enabled = render
+        self.record_substeps = bool(record_substeps)
+        self.step_substeps = None
 
         self.data = [mujoco.MjData(self.model) for _ in range(n_envs)]
         self.rigs = [ScreenRig(self.cfg.sway, seed=seed * 1000 + i) for i in range(n_envs)]
@@ -72,6 +75,7 @@ class VecPointingEnv:
         self.qdd_sq = np.zeros(n_envs)
         self.det_fallback = 0
         self.det_occluded = 0
+        self.det_offscreen = 0
         self.ep_return = np.zeros(n_envs)
         self.ep_len = np.zeros(n_envs, dtype=np.int64)
         self.episodes: list[tuple[float, int, bool]] = []
@@ -106,6 +110,7 @@ class VecPointingEnv:
         d.qacc[:] = 0.0
         d.ctrl[:] = 0.0
         mujoco.mj_forward(self.model, d)
+        self.ctrl.reset(i)
         self.rigs[i].reset()
         self.t[i] = 0.0
         self.steps[i] = 0
@@ -221,6 +226,8 @@ class VecPointingEnv:
         m = self.model
         self.tau_sq[:] = 0.0
         self.qdd_sq[:] = 0.0
+        if self.record_substeps:
+            self.step_substeps = [None] * self.n
         for i in range(self.n):
             d = self.data[i]
             q7_start = d.qpos[self.info.qadr].copy()
@@ -228,14 +235,34 @@ class VecPointingEnv:
             dq7 = np.clip(q7_start + dq7, self.info.q_lo, self.info.q_hi) - q7_start
             self.q7_prev[i] = q7_start
             self.last_action[i] = dq7
+            tau_prev = (d.ctrl * self.info.gear).copy()
+            self.ctrl.begin_period(d, q7_start, dq7, tau_prev, env_idx=i)
             tau_sq = 0.0
             qdd_sq = 0.0
+            t0 = self.t[i]
+            subs = None
+            if self.record_substeps:
+                subs = {"t": [], "q7": [], "qd7": [], "qacc7": [], "tau": [], "fingertip": []}
             for k in range(self.nsub):
-                tau = self.ctrl(d, q7_start, dq7, (k + 1) / self.nsub)
+                tau = self.ctrl(d, k / self.nsub, env_idx=i)
                 d.ctrl[:] = tau / self.info.gear
                 mujoco.mj_step(m, d)
                 tau_sq += float(np.sum(tau**2))
                 qdd_sq += float(np.sum(d.qacc[self.info.dadr] ** 2))
+                if subs is not None:
+                    # mj_step integrates qpos but leaves xpos/xmat from the pre-step
+                    # kinematics; refresh them so the fingertip matches the state.
+                    mujoco.mj_kinematics(m, d)
+                    subs["t"].append(t0 + (k + 1) * self.dt)
+                    subs["q7"].append(d.qpos[self.info.qadr].copy())
+                    subs["qd7"].append(d.qvel[self.info.dadr].copy())
+                    subs["qacc7"].append(d.qacc[self.info.dadr].copy())
+                    subs["tau"].append(tau.copy())
+                    subs["fingertip"].append(self.info.fingertip(d).copy())
+            if subs is not None:
+                self.step_substeps[i] = {
+                    key: np.asarray(val, dtype=np.float64) for key, val in subs.items()
+                }
             self.tau_sq[i] = tau_sq / self.nsub
             self.qdd_sq[i] = qdd_sq / self.nsub
             self.t[i] += self.nsub * self.dt
@@ -256,7 +283,21 @@ class VecPointingEnv:
             hi = np.array([r[1] for r in self.cfg.det_size_range])
             bad = bad | (size < lo) | (size > hi)
             occ = self._occluded(idx)
+            # The hand may point outside the screen image (e.g. at t=0 for a pose
+            # that was never calibrated to be inside it).  YOLO cannot report a
+            # purple centre then, and its false positives on the arm are unusable,
+            # so use the proprioceptive projection whenever that lies off-image.
+            uv_c = ana[:, 1]
+            margin = 2.0
+            off = (
+                (uv_c[:, 0] < margin)
+                | (uv_c[:, 0] > C.IMAGE_SIZE - margin)
+                | (uv_c[:, 1] < margin)
+                | (uv_c[:, 1] > C.IMAGE_SIZE - margin)
+            )
             use_ana = bad | occ
+            use_ana[:, 1] |= off
+            self.det_offscreen += int(off.sum())
             if use_ana.any():
                 self.det_fallback += int(bad.sum())
                 self.det_occluded += int(occ.sum())
@@ -305,6 +346,7 @@ class VecPointingEnv:
             "hold": info_hold,
             "images": imgs,
             "occluded": occ if self.render_enabled else np.zeros((self.n, 2), bool),
+            "substeps": self.step_substeps,
         }
         # true joint state of this step, captured *before* a done-env is reset
         # (evaluation plots need the state of the final, successful step)
@@ -340,5 +382,6 @@ class VecPointingEnv:
         centers = self._analytic_centers(range(self.n))
         q = np.stack([self.data[i].qpos[self.info.qadr] for i in range(self.n)])
         v = np.stack([self.data[i].qvel[self.info.dadr] for i in range(self.n)])
+        a = np.stack([self.data[i].qacc[self.info.dadr] for i in range(self.n)])
         tip = np.stack([self.info.fingertip(self.data[i]) for i in range(self.n)])
-        return {"centers": centers, "q7": q, "qd7": v, "fingertip": tip, "t": self.t.copy()}
+        return {"centers": centers, "q7": q, "qd7": v, "qacc7": a, "fingertip": tip, "t": self.t.copy()}

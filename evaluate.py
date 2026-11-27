@@ -6,6 +6,9 @@ dynamics, clip them to the actuator limits, integrate 20 x 2 ms physics steps,
 render the virtual screen, detect both spheres with YOLO, repeat until the
 pointing task succeeds or the step limit is hit.
 
+By default the deployment ``filt`` governor executes the increments; pass
+``--smooth step`` to reproduce the original step-held executor.
+
 Outputs (under log/):
     eval_curves.png   end-effector speed / acceleration + joint angles / velocities
     eval_trajectory.png   image-space path of the hand pointing sphere vs the target
@@ -53,11 +56,32 @@ def main():
                     help="0 = use the policy mean; >0 = sample with this std")
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--tag", default="eval")
+    ap.add_argument("--smooth", default="filt",
+                    choices=["traj", "filt", "step", "minjerk", "linear"],
+                    help="action_smooth; default filt (deployment/fine-tune), use step for the original executor")
+    ap.add_argument("--omega", type=float, default=None,
+                    help="override traj_omega_n")
+    ap.add_argument("--vend", default=None, choices=["flow", "rest"],
+                    help="override traj_vend")
+    ap.add_argument("--qdd-max", type=float, default=None,
+                    help="override traj_qdd_max")
+    ap.add_argument("--filt-omega", type=float, default=None,
+                    help="override filt_omega")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ensure_scene()
     cfg = C.default_config()
+    if args.smooth:
+        cfg.control.action_smooth = args.smooth
+    if args.omega is not None:
+        cfg.control.traj_omega_n = args.omega
+    if args.vend is not None:
+        cfg.control.traj_vend = args.vend
+    if args.qdd_max is not None:
+        cfg.control.traj_qdd_max = args.qdd_max
+    if args.filt_omega is not None:
+        cfg.control.filt_omega = args.filt_omega
     cfg.ppo.num_envs = 1
     if args.steps:
         cfg.episode.max_steps = args.steps
@@ -72,7 +96,9 @@ def main():
     policy, obs_norm, ckpt = load_policy(ckpt_path, device)
     print(f"loaded {ckpt_path} (update {ckpt.get('update')})")
 
-    env = VecPointingEnv(cfg, n_envs=1, seed=12345, device=str(device))
+    env = VecPointingEnv(cfg, n_envs=1, seed=12345, device=str(device),
+                         record_substeps=True)
+    print(f"controller {cfg.control.action_smooth}")
     print(f"episode limit {cfg.episode.max_steps} steps "
           f"({cfg.episode.max_steps * cfg.control.substeps * env.dt:.2f} s of simulated time)")
 
@@ -89,11 +115,13 @@ def main():
     best_score = None
     best_frames, best_mains = [], []
     obs = env.reset()
+    ep_sub = _new_sub(env)
     ep = 0
     t_sim = 0.0
     step_records = []
     t_wall = time.time()
     max_steps = cfg.episode.max_steps
+    dt_step = cfg.control.substeps * env.dt
     while ep < args.episodes:
         with torch.no_grad():
             a, logp, val = policy.act(torch.as_tensor(obs_norm(obs), device=device))
@@ -101,8 +129,12 @@ def main():
                 a = torch.tanh(torch.atanh(a.clamp(-0.999, 0.999)) +
                                torch.randn_like(a) * args.sample_std)
         out_step = env.step(a.cpu().numpy())
+        # one control period is 20 x 2 ms; keep every physics step for the plots
+        sub = out_step.info["substeps"][0]
+        for key in ep_sub:
+            ep_sub[key].extend(np.asarray(sub[key]).tolist())
         step_records.append({
-            "t": float(t_sim),
+            "t": float(t_sim + dt_step),
             "q7": out_step.info["q7"][0].copy(),
             "qd7": out_step.info["qd7"][0].copy(),
             "fingertip": out_step.info["fingertip"][0].copy(),
@@ -114,7 +146,7 @@ def main():
             "success": bool(out_step.success[0]),
             "action": a.cpu().numpy()[0].copy(),
         })
-        t_sim += cfg.control.substeps * env.dt
+        t_sim += dt_step
         obs = out_step.obs
         if not args.no_video and env.renderer is not None:
             cur_frames.append(out_step.info["images"][0].copy())
@@ -129,7 +161,8 @@ def main():
                    "final_dist_px": float(out_step.info["dist_px"][0]),
                    "min_dist_px": float(min(r["dist_px"] for r in step_records)),
                    "settled_dist_px": float(np.mean([r["dist_px"] for r in step_records[-5:]])),
-                   "return": float(sum(r["reward"] for r in step_records))}
+                   "return": float(sum(r["reward"] for r in step_records)),
+                   "substeps": {k: np.asarray(v) for k, v in ep_sub.items()}}
             records.append((rec, step_records))
             print(f"episode {ep}: {'SUCCESS' if rec['success'] else 'timeout'} "
                   f"after {rec['steps']} steps ({rec['steps']*0.04:.2f} s), "
@@ -145,6 +178,7 @@ def main():
             cur_frames, cur_mains = [], []
             ep += 1
             step_records = []
+            ep_sub = _new_sub(env)
             t_sim = 0.0
             t_wall = time.time()
 
@@ -153,13 +187,14 @@ def main():
     stats = {
         "checkpoint": str(ckpt_path),
         "update": int(ckpt.get("update", -1)),
-        "episodes": [r for r, _ in records],
+        "episodes": [{k: v for k, v in r.items() if k != "substeps"} for r, _ in records],
         "success_rate": n_succ / len(records),
         "mean_final_dist_px": float(np.mean([r["final_dist_px"] for r, _ in records])),
         "image_size": C.IMAGE_SIZE,
         "pixels_per_metre": C.IMAGE_SIZE / C.SCREEN_SIZE,
         "det_fallback": int(env.det_fallback),
         "det_occluded": int(env.det_occluded),
+        "det_offscreen": int(env.det_offscreen),
         "env_steps": int(sum(r["steps"] for r, _ in records)),
     }
     (out / f"{args.tag}_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
@@ -168,7 +203,9 @@ def main():
     # ------------------------------------------------------------------ plots
     best_i = next((i for i, (r, _) in enumerate(records) if r is best_rec), 0)
     best = records[best_i][1]
-    plot_run(best, out / f"{args.tag}_curves.png", cfg)
+    best_sub = records[best_i][0]["substeps"]
+    plot_run(best, best_sub, out / f"{args.tag}_curves.png", cfg)
+    np.savez(out / f"{args.tag}_substeps.npz", **best_sub)
     plot_trajectory(best, out / f"{args.tag}_trajectory.png", cfg)
 
     # ------------------------------------------------------------------ video
@@ -189,39 +226,61 @@ def _t(rec):
     return np.array([r["t"] for r in rec])
 
 
-def plot_run(rec, path, cfg):
+def _new_sub(env):
+    """Initial (t=0) state of a fresh episode, as lists ready for extension."""
+    st = env.analytic_state()
+    return {
+        "t": [0.0],
+        "q7": [st["q7"][0].copy()],
+        "qd7": [st["qd7"][0].copy()],
+        "qacc7": [np.zeros(7)],
+        "tau": [np.zeros(7)],
+        "fingertip": [st["fingertip"][0].copy()],
+    }
+
+
+def plot_run(rec, sub, path, cfg):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    t = _t(rec)
-    dt = cfg.control.substeps * 0.002
-    tip = np.array([r["fingertip"] for r in rec])
+    t = np.asarray(sub["t"], dtype=np.float64)
+    if t.size < 2:
+        return
+    dt = float(np.median(np.diff(t)))          # 2 ms physics step
+    tip = np.asarray(sub["fingertip"], dtype=np.float64)
     vel = np.gradient(tip, dt, axis=0)
     speed = np.linalg.norm(vel, axis=1)
     acc = np.gradient(vel, dt, axis=0)
     accn = np.linalg.norm(acc, axis=1)
-    q = np.array([r["q7"] for r in rec])
-    qd = np.array([r["qd7"] for r in rec])
+    q = np.asarray(sub["q7"], dtype=np.float64)
+    qd = np.asarray(sub["qd7"], dtype=np.float64)
     dist = np.array([r["dist_px"] for r in rec])
+    nsub = int(cfg.control.substeps)
 
     fig, ax = plt.subplots(2, 2, figsize=(12.5, 7.2))
-    ax[0, 0].plot(t, speed, color="tab:blue")
+    ax[0, 0].plot(t, speed, color="tab:blue", lw=0.9)
     ax[0, 0].set_title("end-effector speed  |v|  [m/s]")
     ax[0, 0].set_ylabel("m/s")
-    ax[0, 1].plot(t, accn, color="tab:red")
+    ax[0, 1].plot(t, accn, color="tab:red", lw=0.9)
     ax[0, 1].set_title("end-effector acceleration  |a|  [m/s$^2$]")
     ax[0, 1].set_ylabel("m/s$^2$")
     for j, name in enumerate(C.JOINTS):
-        ax[1, 0].plot(t, q[:, j], label=name)
-        ax[1, 1].plot(t, qd[:, j], label=name)
+        ax[1, 0].plot(t, q[:, j], label=name, lw=1.0)
+        ax[1, 1].plot(t, qd[:, j], label=name, lw=1.0)
     ax[1, 0].set_title("joint angles  [rad]")
     ax[1, 1].set_title("joint angular velocities  [rad/s]")
     ax[1, 1].legend(fontsize=7, ncol=2, loc="best")
     for a in ax.ravel():
+        # 40 ms policy-decision boundaries
+        for k in range(0, len(t), nsub):
+            a.axvline(t[k], color="0.85", lw=0.6, zorder=0)
         a.set_xlabel("time [s]")
         a.grid(alpha=0.3)
-    fig.suptitle(f"policy rollout  (final centre distance {dist[-1]:.1f} px)")
+    fig.suptitle(
+        f"policy rollout  (2 ms physics samples, grey = 40 ms decisions; "
+        f"final centre distance {dist[-1]:.1f} px)"
+    )
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)

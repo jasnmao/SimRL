@@ -1,0 +1,103 @@
+{
+  "xml": "assets/scene.xml",
+  "raw_xml": "models/test.xml",
+  "det_weights": "yolo_model/best.pt",
+  "det_conf": 0.25,
+  "det_conf_min": 0.2,
+  "det_size_range": [
+    [
+      45.0,
+      160.0
+    ],
+    [
+      15.0,
+      80.0
+    ]
+  ],
+  "det_use_cuda_graph": false,
+  "det_device": "cuda",
+  "det_fallback": true,
+  "obs_vel_scale": 5.0,
+  "obs_acc_scale": 150.0,
+  "out_dir": "log",
+  "seed": 0,
+  "sway": {
+    "enabled": true,
+    "trans_amp": [
+      0.02,
+      0.02,
+      0.015
+    ],
+    "rot_amp_deg": [
+      2.0,
+      2.0,
+      1.5
+    ],
+    "freq_range": [
+      0.25,
+      0.6
+    ],
+    "target_sway_amp": [
+      0.014,
+      0.014
+    ],
+    "target_sway_freq": [
+      0.2,
+      0.5
+    ]
+  },
+  "control": {
+    "max_action": 0.05,
+    "substeps": 20,
+    "action_smooth": "step",
+    "omega_n": 25.0,
+    "zeta": 1.0,
+    "kp": null,
+    "kd": null,
+    "id_clip": true
+  },
+  "episode": {
+    "max_steps": 120,
+    "success_px": 20.0,
+    "success_qvel": 0.5,
+    "success_hold": 3,
+    "target_region": [
+      -0.13,
+      0.13,
+      -0.11,
+      0.11
+    ],
+    "target_min_start_px": 120.0
+  },
+  "reward": {
+    "r1": 0.005,
+    "r2": 0.002,
+    "r3": 0.05,
+    "hold_bonus": 1.0,
+    "success_bonus": 0.0,
+    "dist_scale_px": 200.0,
+    "tau_scale": 20.0,
+    "qdd_scale": 40.0,
+    "qvel_scale": 1.0
+  },
+  "ppo": {
+    "num_envs": 8,
+    "rollout_steps": 64,
+    "total_updates": 220,
+    "gamma": 0.985,
+    "lam": 0.95,
+    "clip": 0.2,
+    "epochs": 6,
+    "minibatch": 256,
+    "lr": 0.0003,
+    "ent_coef": 0.002,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "hidden": [
+      128,
+      128
+    ],
+    "log_std_init": -1.0,
+    "device": "cuda"
+  }
+}

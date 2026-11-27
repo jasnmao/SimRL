@@ -10,13 +10,13 @@
 
 | 文件 | 内容 |
 | --- | --- |
-| `log/ppo_ckpt.pt`, `log/ppo_best.pt` | 训练得到的策略 / 价值网络 + 观测归一化统计 |
-| `log/ppo_log_merged.csv` | 每次 PPO 更新的训练指标（控制台也会实时打印；`clean_log.py` 把多段接力的日志拼成连续编号） |
-| `log/ppo_curves.png` | 训练曲线（回报、成功率、距离、loss） |
-| `log/eval_curves.png` | **最终策略单次运行**：末端速度/加速度、7 关节角度、7 关节角速度 |
+| `log/ppo_best.pt` | **最终策略**（微调 update-150）+ 观测归一化统计 |
+| `log/eval_curves.png` | **最终策略单次运行**：2 ms 采样的末端速度/加速度、7 关节角度、7 关节角速度 |
 | `log/eval_trajectory.png` | 屏幕上指尖轨迹 vs 目标 |
+| `log/eval_stats.json` | 上述运行的数值统计（6/6 成功，平均 9.27 px） |
+| `log/eval_substeps.npz` | 上述运行的 2 ms 原始轨迹（t, q7, qd7, qacc7, tau, fingertip） |
 | `log/demo.mp4` | 演示视频（第三人称全景，拍到完整人体模型 + 右下角策略视角内嵌） |
-| `log/eval_stats.json` | 上述运行的数值统计 |
+| `log/baseline_step/` | 旧 step 执行器的完整归档（update-120 策略、评估、训练日志、demo），用于对比 |
 
 ---
 
@@ -172,19 +172,35 @@ u = 320 + (640 / S) * (-p_z)      v = 320 - (640 / S) * p_y
 
 ### 动作 → 力矩
 
-策略输出 7 维 `a ∈ [-1,1]`，对应 7 个关节的**位置增量**（`max_action = 0.05 rad`）：
+策略输出 7 维 `a ∈ [-1,1]`，对应 7 个关节的**位置增量**（`max_action = 0.05 rad`）。
+执行器分两套：
+
+| 场景 | 默认模式 | 说明 |
+| --- | --- | --- |
+| 从零训练原始策略 | `step` | 复现最初没有任何修改的控制方法：目标在周期开始直接跳到 `q_start + 0.05a` |
+| 微调 / 评估 / 实际执行 | `filt` | 二阶临界阻尼参考 governor，把目标在 40 ms 内平滑推进 |
+
+`train.py` 会自动选择：不带 `--resume` 时用 `step`，带 `--resume` 时用 `filt`；
+`evaluate.py` 默认 `filt`。两者都可以用 `--smooth` 显式覆盖，
+`ControlConfig.action_smooth` 仍可选 `step` / `filt` / `traj` / `minjerk` / `linear`。
 
 ```
-q_des = clip(q_start + 0.05 * a, 关节限位)
-tau   = kp * (q_des - q) - kd * dq + tau_hold        # 前馈保持重力/惯量项
-tau   = clip(tau, 执行器力矩下限, 上限)               # 由 gear × ctrlrange 得到，非对称
+q_goal = clip(q_ref + 0.05 * a, 关节限位)              # 本周期要到达的参考位置
+g(s)   = q_goal_prev + (q_goal - q_goal_prev) * s      # s = k/20，周期内线性推进
+qdd_ref = ωf² * (g - q_ref) - 2·ζf·ωf * qd_ref         # 临界阻尼二阶参考
+q_ref  += qd_ref * dt_sub                              # 2 ms 积分
+tau = kp * (q_ref - q) - kd * (qd_ref - dq) + tau_hold
+tau = clip(tau, 执行器力矩下限, 上限)
 ```
 
-* `tau_hold` 由 `mj_inverse` 求出（把重力、科氏力、约束力全部算进去，
-  用 `qfrc_inverse` 的关节分量），保证"零误差时不需要额外力矩"。
-* 增益按初始姿态的惯量对角缩放：`kp = I·ωn²`，`kd = 2·ζ·I·ωn`（`ωn=25 rad/s`，临界阻尼）。
-  于是小惯量关节（腕、肘）动作快、大惯量关节（肩）稍慢，且力矩自然饱和到限幅，
-  即"在力矩能力内尽可能快地跟上目标"。
+* 旧的 `step` 模式会在每 40 ms 把目标直接跳变到 `q_start + 0.05a`，力矩和加速度在
+  周期边界上出现台阶；`filt` 用 `ωf = 15 rad/s` 的临界阻尼参考把目标"追"过去，
+  周期边界不再是不连续点。
+* `tau_hold` 由 `mj_inverse` 求出（重力、科氏力、约束力），
+  用 `qfrc_inverse` 的关节分量；力矩不足时按执行器限幅裁剪。
+* 反馈增益按初始姿态的惯量对角缩放：`kp = I·ωn²`，`kd = 2·ζ·I·ωn`
+  （`ωn=25 rad/s`，临界阻尼）；`filt` 的参考带宽 `ωf` 与反馈带宽 `ωn` 分开，
+  前者决定"目标推进多快"，后者决定"关节跟得多紧"。
 * 每个决策步执行 **20 个 2 ms 物理步**（共 40 ms）。
 
 ### 奖励
@@ -240,60 +256,93 @@ python -c "from simrl.scene import build_scene; build_scene()"
 # 2) （可选）重新解初始姿态并写回 config.py
 python solve_init_pose.py --write
 
-# 3) 训练（控制台实时打印进度与耗时，log/ 下存 checkpoint 和 CSV）
-python train.py --updates 240 --envs 8 --rollout 64
+# 3) 从零训练（默认 step 执行器，复现原始控制方法）
+python train.py --updates 220 --envs 8 --rollout 64 --tag ppo
 
-# 4) 接着训练（可选，--resume 会连观测归一化统计一起恢复；CSV 以追加方式续写）
-python train.py --updates 140 --envs 8 --rollout 64 --resume log/ppo_ckpt.pt
-
-# 5) 把多段训练日志拼成连续编号并重画曲线
-python clean_log.py
-
-# 6) 用最终策略做真实运行：曲线 + 轨迹图 + 演示视频
-python evaluate.py --ckpt log/ppo_ckpt.pt --episodes 6
+# 4) 用最终策略做真实运行：2 ms 曲线 + 轨迹图 + 演示视频
+python evaluate.py --episodes 6
 ```
 
 `train.py` 每 5 次更新打印一行（环境步数、速度、回报、回合长度、成功率、平均距离、
 policy/value loss、熵、clip 比例、检测回退次数、学习率），每 25 次存一次 checkpoint，
-按"成功率 − 平均距离/500"打分存 `ppo_best.pt`。
+按"成功率 − 平均距离/500"打分存 `{tag}_best.pt`；CSV 和训练曲线分别写到
+`log/{tag}_log.csv` 与 `log/{tag}_curves.png`。
 `evaluate.py` 每局跑完打印成功与否、步数、末距离、最小距离、最后 5 步平均距离，
 并把"最像样的一局"（成功优先、步数越多越好）做成 `log/demo.mp4`（4 倍慢放）。
 
+### 6.1 微调已有策略
+
+微调适合"策略已经会做任务，但想让它更快/更准"的情况。和从零训练的区别是：
+用 `--resume` 载入模型和观测归一化统计，用更小的学习率，只跑少量更新。
+
+```powershell
+# 从当前最优策略继续微调 100 次：学习率 5e-5，熵系数降到 0.001
+# --resume 会自动切到 filt 执行器；这里显式写出，强调和从零训练的区别
+python train.py --tag ppo_ft2 --resume log/ppo_best.pt --updates 100 --envs 8 --rollout 64 --lr 5e-5 --ent 0.001 --smooth filt
+
+# 先看训练曲线和日志，再跑 12 局确定性评估
+python evaluate.py --ckpt log/ppo_ft2_best.pt --episodes 12
+
+# 只有确认比原来更好，才覆盖默认策略（原文件会自动进 git 历史）
+Copy-Item log/ppo_ft2_best.pt log/ppo_best.pt
+```
+
+几个要点：
+
+* **执行器切换**：`train.py` 从零训练默认 `step`，带 `--resume` 默认 `filt`；
+  两者都能用 `--smooth` 覆盖。微调做的是"把 step 策略迁移到 filt 执行器"，
+  不是在 filt 上从零学。
+* `--resume` 只恢复 **模型参数 + 观测归一化统计**；优化器状态和 `update` 计数会重新开始。
+  CSV 用新 `--tag` 时从 1 开始（同 tag 且文件已存在则追加），所以微调请用新 tag，
+  不要覆盖原 checkpoint。
+* 学习率要比从零训练小一个量级：本项目原训练是 `3e-4`，微调用 `1e-4` 或 `5e-5`。
+  学习率太大、更新次数太多，会把已经学会的指向行为破坏掉。
+* 推荐先微调 **100–150 次**，每次约 512 步 × 8 环境；本项目最优结果就是
+  从旧 update-120 策略微调 **150 次、lr=1e-4、ent=0.001** 得到的：
+  12/12 成功、平均 11.1 px、平均 36 步。
+* 判断是否"更好"不要只看训练时 8 个 rollout 的成功率，它噪声很大；
+  用 `evaluate.py --episodes 12` 的确定性评估比较成功率、平均末距离和平均步数。
+* 想回到旧执行器/旧策略做对比，原始 checkpoint 在
+  `log/baseline_step/ppo_ckpt.pt`（update 120）和 `log/baseline_step/ppo_best.pt`；
+  复现旧结果用
+  `python evaluate.py --ckpt log/baseline_step/ppo_ckpt.pt --smooth step --episodes 6 --tag baseline_step_eval`
+  （用独立 `--tag`，避免覆盖当前的 `log/eval_*.png`）。
+
+`--lr` 和 `--ent` 是 `train.py` 为微调新增的参数；不传时使用 `PPOConfig` 的默认值。
+
+
 ## 7. 结果
 
-**训练规模**：2 段接力，共 **360 次更新 / 184,320 个环境步 / 约 50 分钟**
-（8 个环境并行，关掉 CUDA Graph 后 59–62 环境步/秒；每个决策步 = 20 个物理子步
-+ 一次 640×640 离屏渲染 + 一次 YOLO 前向）。
+**训练与微调**：旧执行器下的原始策略训练了 360 次更新（240 + 120 接力，
+184,320 个环境步，约 50 分钟）；切换到 `filt` 执行器后，从 update-120 策略
+微调 **150 次更新 / 76,800 步 / 24.4 分钟**，学习率 `1e-4`、`ent_coef=0.001`。
+微调后的策略是当前默认策略 `log/ppo_best.pt`（update 150）。
 
-| 阶段 | 更新数 | 用时 | 变化 | 结束时的 rollout 成功率 / 平均距离 |
-|---|---|---|---|---|
-| 1 | 240 | 32.9 min | 从零开始（新屏幕几何 + 新初始姿态 + `hold_bonus`） | 100% / 68.2 px |
-| 2 | 120 | 17.3 min | `--resume` 接着训练，把精度磨上去 | 86.7% / 61.8 px |
+**最终策略（`log/ppo_best.pt`，确定性动作即策略均值）**：
 
-（CSV 里 `dist_px_mean` 是含"从远到近"整个 rollout 的平均，所以是 60 px 量级；
-收敛后的精度看下面的"末距离"。）
-
-![训练曲线](log/ppo_curves.png)
-
-**最终策略（`log/ppo_ckpt.pt`，确定性动作即策略均值）**：`evaluate.py --episodes 6`
-
-* 成功率 **6/6**，末距离 **12.9 px 均值**（19.2 / 9.2 / 7.4 / 17.3 / 12.0 / 12.1），
-  最小距离最低到 **7.4 px**（屏幕平面上约 0.8 cm）
-* 用 19–27 步收敛（0.76–1.08 s），平均 23 步 ≈ 0.92 s
-* 演示视频 `log/demo.mp4`（1280×720、25 fps、4 倍慢放、4.3 s）：第三人称全景拍全人体
+* 12 局确定性评估：**12/12 成功**，平均末距离 **11.1 px**，平均 **36.0 步**
+  （最长 48 步，没有超时）
+* 最后 6 局：**6/6 成功**，平均末距离 **9.27 px**，步数 47/37/59/27/31/31
+* 相比旧 `step` 执行器的 update-120 策略：末距离 15.1 → 11.1 px（−27%），
+  平均步数 46.3 → 36.0（−22%），同时 40 ms 周期边界上的加速度/力矩跳变基本消失
+* 演示视频 `log/demo.mp4`（25 fps、4 倍慢放）：第三人称全景拍全人体
   + 指尖→光标球的指向射线，右下角内嵌策略实际看到的 640×640 画面
-* 曲线：`log/eval_curves.png`（末端速度/加速度 + 7 关节角度/角速度 vs 时间）、
-  `log/eval_trajectory.png`（屏幕空间轨迹）、`log/eval_stats.json`
-* 完整训练日志：`log/ppo_log_merged.csv`（360 行，连续编号）
+* 曲线：`log/eval_curves.png`（2 ms 采样的末端速度/加速度 + 7 关节角度/角速度，
+  灰线是 40 ms 决策边界）、`log/eval_trajectory.png`（屏幕空间轨迹）、
+  `log/eval_stats.json`、`log/eval_substeps.npz`（2 ms 原始数据）
+* 旧 `step` 执行器的完整归档：`log/baseline_step/`（update-120 策略、评估、
+  训练日志、demo）
 
 ![最终运行曲线](log/eval_curves.png)
 
 ![屏幕轨迹](log/eval_trajectory.png)
 
-**检测器**：最终评估的 138 个决策步里，34 次（24.6%）有单球置信度偏低或检测框尺寸异常、
-44 次（31.9%）有球被身体遮挡，都自动回退到解析投影；其余帧 YOLO 直接可用（置信度 0.93–0.96）。
+**检测器**：最终 6 局评估的 232 个决策步里，61 次（26.3%）有单球置信度偏低或检测框尺寸异常、
+75 次（32.3%）有球被身体遮挡，都自动回退到解析投影；其余帧 YOLO 直接可用（置信度 0.93–0.96）。
 新几何下初始姿态就已经把手臂伸到屏幕前方约 20 cm，手掌更容易压住球的投影，
 遮挡回退比上一版更频繁——这是"球贴在屏幕上、手在球后面指"这个设定固有的。
+当手部投影落在 640×640 画面之外时（例如初始姿态在屏幕外），也会强制使用本体感知投影，
+对应计数器 `det_offscreen`。
 
 ## 8. 踩过的坑（留给后人）
 

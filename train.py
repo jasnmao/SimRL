@@ -2,11 +2,14 @@
 
 Usage
 -----
-    python train.py                 # full run (config defaults)
+    python train.py                 # full run from scratch (original "step" executor)
     python train.py --updates 50    # short smoke run
+    python train.py --resume log/ppo_best.pt --updates 100  # fine-tune ("filt" executor)
 
 Everything (checkpoints, the CSV progress log, the learning curves) is written
 under ``log/``.  Progress and timing are printed to the console as training goes.
+The controller is selected automatically: ``step`` from scratch, ``filt`` with
+``--resume``; ``--smooth`` overrides either choice.
 """
 
 from __future__ import annotations
@@ -35,12 +38,29 @@ def main():
     ap.add_argument("--rollout", type=int, default=None, help="override rollout_steps")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--tag", type=str, default="ppo")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="override learning rate (useful for fine-tuning)")
+    ap.add_argument("--ent", type=float, default=None,
+                    help="override entropy coefficient")
     ap.add_argument("--resume", type=str, default=None,
                     help="checkpoint to continue training from (model + obs normaliser)")
+    ap.add_argument("--smooth", type=str, default=None,
+                    choices=["step", "filt", "traj", "minjerk", "linear"],
+                    help="override action_smooth; default: step from scratch, filt when --resume")
     args = ap.parse_args()
 
     cfg = C.default_config()
     p = cfg.ppo
+    # Keep the original training recipe and the deployment/fine-tuning recipe separate:
+    # a run from scratch reproduces the original step-held executor, while a fine-tune
+    # starts from a policy that was trained with step and continues under the smooth
+    # governor used at deployment time.
+    if args.smooth is not None:
+        cfg.control.action_smooth = args.smooth
+    elif args.resume:
+        cfg.control.action_smooth = "filt"
+    else:
+        cfg.control.action_smooth = "step"
     if args.updates is not None:
         p.total_updates = args.updates
     if args.envs is not None:
@@ -49,6 +69,10 @@ def main():
         p.rollout_steps = args.rollout
     if args.seed is not None:
         cfg.seed = args.seed
+    if args.lr is not None:
+        p.lr = args.lr
+    if args.ent is not None:
+        p.ent_coef = args.ent
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -63,6 +87,8 @@ def main():
     print("MuJoCo visual pointing task -- PPO training")
     print(f"  envs {p.num_envs}  rollout {p.rollout_steps}  updates {p.total_updates}  "
           f"=> {p.num_envs * p.rollout_steps * p.total_updates:,} env steps")
+    print(f"  controller {cfg.control.action_smooth}  "
+          f"(auto: step from scratch, filt with --resume; --smooth overrides)")
     print(f"  device {device}  torch {torch.__version__}")
     print("=" * 78)
 
@@ -87,7 +113,7 @@ def main():
     csv_path = out / f"{args.tag}_log.csv"
     fields = ["update", "env_steps", "wall_time", "steps_per_s", "return_mean", "ep_len",
               "success_rate", "dist_px_mean", "policy_loss", "value_loss", "entropy",
-              "clipfrac", "det_fallback", "det_occluded", "lr"]
+              "clipfrac", "det_fallback", "det_occluded", "det_offscreen", "lr"]
     append = bool(args.resume) and csv_path.exists()
     with open(csv_path, "a" if append else "w", newline="", encoding="utf-8") as fh:
         if not append:
@@ -152,7 +178,8 @@ def main():
                    value_loss=round(stats["value_loss"], 5),
                    entropy=round(stats["entropy"], 4),
                    clipfrac=round(stats["clipfrac"], 4),
-                   det_fallback=env.det_fallback, det_occluded=env.det_occluded, lr=p.lr)
+                   det_fallback=env.det_fallback, det_occluded=env.det_occluded,
+                   det_offscreen=env.det_offscreen, lr=p.lr)
         for k, v in row.items():
             history[k].append(v)
         with open(csv_path, "a", newline="", encoding="utf-8") as fh:
@@ -185,7 +212,8 @@ def main():
     print("=" * 78)
     print(f"training finished: {env_steps:,} env steps in {total/60:.2f} min "
           f"({env_steps/total:.1f} steps/s), {total/p.total_updates:.2f} s per update")
-    print(f"detector fallbacks: {env.det_fallback}  occluded-ball overrides: {env.det_occluded}")
+    print(f"detector fallbacks: {env.det_fallback}  occluded-ball overrides: {env.det_occluded}  "
+          f"off-screen-hand overrides: {env.det_offscreen}")
     plot_curves(history, out / f"{args.tag}_curves.png")
 
 

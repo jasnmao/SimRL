@@ -101,7 +101,7 @@ class SwayConfig:
 class ControlConfig:
     max_action: float = 0.05      # rad, bound of one joint-position increment
     substeps: int = 20            # 20 * 0.002 s = 40 ms per decision
-    action_smooth: str = "step"
+    action_smooth: str = "step"   # "step" = original executor; "filt" for fine-tune/deploy
     # Joint-space impedance of the servo.  By default the gains are derived from
     # the inertia diagonal at the Init pose: kp = I*omega_n^2, kd = 2*zeta*I*omega_n.
     omega_n: float = 25.0         # rad/s natural frequency of the position loop
@@ -109,6 +109,19 @@ class ControlConfig:
     kp: float | None = None       # explicit override
     kd: float | None = None
     id_clip: bool = True          # clip torques to the actuator limits
+    # Quintic trajectory mode.  A rest-to-rest 0.05 rad move in 40 ms would need
+    # ~180 rad/s^2, far beyond the actuators, so the default "flow" profile reaches
+    # q0+dq with the matching cruise velocity dq/T (and decelerates when dq == 0).
+    traj_omega_n: float = 18.0    # feedback bandwidth used by the traj mode
+    traj_zeta: float = 1.0
+    traj_vend: str = "flow"       # "flow" | "rest"
+    traj_qdd_max: float = 300.0   # rad/s^2, clamp on the measured initial acceleration
+    # Critically damped second-order reference governor ("filt" mode).  Instead of
+    # an infeasible 40 ms rest-to-rest quintic it low-pass filters the position
+    # target, so the servo never chases a reference faster than the actuators can
+    # follow.  filt_omega is the bandwidth of the governor, not of the servo.
+    filt_omega: float = 15.0      # rad/s
+    filt_zeta: float = 1.0
 
 
 @dataclass
